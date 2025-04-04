@@ -1,0 +1,12 @@
+{
+    "name": "ubuntu/spiral-tower-bot",
+    "autoload": {
+        "psr-4": {
+            "Ubuntu\\SpiralTowerBot\\": "src/"
+        }
+    },
+    "require": {
+        "j0k3r/php-readability": "^2.0",
+        "guzzlehttp/guzzle": "^7.9"
+    }
+}
