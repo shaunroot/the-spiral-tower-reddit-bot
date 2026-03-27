@@ -10,8 +10,10 @@
 // https://docs.google.com/document/d/19VIBoX6QmVRZCIQ-2liGAQFvJD9aglFoIbzhgySnqHI/edit
 
 
+set_time_limit(0);
 require 'vendor/autoload.php';
 require_once('/var/www/html/wp-load.php');
+require_once('/var/www/html/wp-content/plugins/the-spiral-tower/includes/class-spiral-tower-image-generator.php');
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
@@ -67,6 +69,11 @@ class RedditBot
         $this->wpUser = $config['wordpress']['user'];
         $this->wpPassword = $config['wordpress']['password'];
         $this->wpSiteId = $config['wordpress']['site_id'];
+
+        // Switch to the correct blog in WordPress multisite
+        if (is_multisite() && $this->wpSiteId) {
+            switch_to_blog($this->wpSiteId);
+        }
 
         // OpenAI credentials
         $this->openAiUrl = $config['openai']['url'];
@@ -128,7 +135,6 @@ class RedditBot
         }
     }
 
-
     public function monitorPosts()
     {
         echo "Checking for new posts in r/{$this->subreddit} with [New Floor] tag...\n";
@@ -154,6 +160,10 @@ class RedditBot
                 return;
             }
 
+            // Track the most recent post timestamp we encounter
+            $newestTimestamp = $lastTimestamp;
+            $processedPostIds = [];
+
             foreach ($posts['data']['children'] as $post) {
                 if (!isset($post['data']['title'])) {
                     continue; // Skip if title is missing
@@ -165,6 +175,18 @@ class RedditBot
                 $selftext = isset($post['data']['selftext']) ? $post['data']['selftext'] : '';
                 $redditUsername = isset($post['data']['author']) ? $post['data']['author'] : ''; // Get Reddit username
 
+                // Keep track of the newest post timestamp
+                if ($createdTime > $newestTimestamp) {
+                    $newestTimestamp = $createdTime;
+                }
+
+                // Skip duplicate posts within the same run (Reddit API can return duplicates)
+                if (in_array($postId, $processedPostIds)) {
+                    echo "Skipping duplicate post ID: $postId (already processed in this run)\n";
+                    continue;
+                }
+                $processedPostIds[] = $postId;
+
                 if ($createdTime <= $lastTimestamp) {
                     echo "Skipping post ID: $postId (posted at " . date('Y-m-d H:i:s', $createdTime) . ", which is before or equal to last processed time: " . date('Y-m-d H:i:s', $lastTimestamp) . ")\n";
                     continue; // Skip if post was posted before last processed time
@@ -174,87 +196,51 @@ class RedditBot
                 echo "Post Title: $title\n";
                 echo "Reddit Author: $redditUsername\n";
 
-                try {
-                    // FIXED: Allow optional whitespace between [New Floor] and [number], and allow empty floor numbers
-                    if (preg_match("/^\[New Floor\]\s*\[([^\]]*)\](.*)/i", $title, $matches)) {
-                        $floorNumber = trim($matches[1]); // Could be empty string or a number
-                        $floorName = trim($matches[2]);
+                if (preg_match("/^\[New Floor\]\[(\d+)\](.*)/i", $title, $matches)) {
+                    $floorNumber = $matches[1];
+                    $floorName = trim($matches[2]);
 
-                        // Handle empty floor number
-                        if (empty($floorNumber)) {
-                            echo "✅ Match found! No floor number specified, Floor Name: '$floorName'\n";
-                            // Skip the floor number existence check since there's no number
-                        } else {
-                            echo "✅ Match found! Floor Number: $floorNumber, Floor Name: '$floorName'\n";
+                    echo "✅ Match found! Floor Number: $floorNumber, Floor Name: '$floorName'\n";
 
-                            // Check if floor number already exists (only if there's a number)
-                            if ($this->floorNumberExists($floorNumber)) {
-                                echo "⚠️ Floor number $floorNumber already exists. Notifying user.\n";
+                    // Check if floor number already exists
+                    if ($this->floorNumberExists($floorNumber)) {
+                        echo "⚠️ Floor number $floorNumber already exists. Notifying user.\n";
 
-                                // Reply to the Reddit post with a comment about the duplicate floor
-                                $this->replyToPost($postId, "Sorry, that floor has already been claimed. You can create a room on that floor if you like.");
-
-                                // UPDATE TIMESTAMP TO PREVENT LOOP
-                                $this->updateLastTimestamp($createdTime);
-                                echo "✅ Updated timestamp after duplicate floor notification\n";
-                                continue; // Skip to next post
-                            }
-                        }
-
-                        // Get or create WordPress user for the Reddit author
-                        $authorId = $this->checkUserExists($redditUsername);
-                        if (!$authorId) {
-                            $authorId = $this->createWordPressUser($redditUsername);
-                        }
-
-                        $postBody = $this->createWordPressPost($floorName, $selftext, $floorNumber, $authorId, $redditUsername);
-                        $this->sendRedditPrivateMessage(
-                            $redditUsername,
-                            "Your Floor Has Been Created",
-                            "Your floor '$floorName' (number $floorNumber) has been successfully created on The Spiral Tower.\n\n" .
-                            "View it here: " . (isset($postBody['link']) ? $postBody['link'] : "https://www.thespiraltower.net/floor/")
-                        );
-
-                        // Reply to the Reddit post with a comment
-                        $this->replyToPost($postId, "Floor '$floorName' has been created in the tower!", $postBody['link']);
-
-                        // UPDATE TIMESTAMP AFTER SUCCESSFUL CREATION
-                        $this->updateLastTimestamp($createdTime);
-                        echo "✅ Updated timestamp after successful floor creation\n";
-
-                    } else {
-                        echo "No match found in this post title.\n";
-                        // UPDATE TIMESTAMP EVEN FOR NON-MATCHING POSTS
-                        $this->updateLastTimestamp($createdTime);
-                        echo "✅ Updated timestamp after non-matching post\n";
+                        // Reply to the Reddit post with a comment about the duplicate floor
+                        $this->replyToPost($postId, "Sorry, that floor has already been claimed. You can create a room on that floor if you like.");
+                        continue;
                     }
 
-                } catch (\Exception $e) {
-                    // SEND ERROR MESSAGE TO root88
-                    $errorMessage = "❌ ERROR processing Reddit post:\n\n" .
-                        "Post ID: $postId\n" .
-                        "Title: $title\n" .
-                        "Author: $redditUsername\n" .
-                        "Error: " . $e->getMessage() . "\n" .
-                        "File: " . $e->getFile() . "\n" .
-                        "Line: " . $e->getLine() . "\n\n" .
-                        "Timestamp: " . date('Y-m-d H:i:s');
+                    // Get or create WordPress user for the Reddit author
+                    $authorId = $this->checkUserExists($redditUsername);
+                    if (!$authorId) {
+                        $authorId = $this->createWordPressUser($redditUsername);
+                    }
 
-                    echo "❌ Error processing post $postId: " . $e->getMessage() . "\n";
-
-                    // Send error notification
+                    $postBody = $this->createWordPressPost($floorName, $selftext, $floorNumber, $authorId, $redditUsername);
                     $this->sendRedditPrivateMessage(
-                        "root88",
-                        "Bot Error - Post Processing Failed",
-                        $errorMessage
+                        $redditUsername,
+                        "Your Floor Has Been Created",
+                        "Your floor '$floorName' (number $floorNumber) has been successfully created on The Spiral Tower.\n\n" .
+                        "View it here: " . (isset($postBody['link']) ? $postBody['link'] : "https://www.thespiraltower.net/floor/")
                     );
 
-                    // Still update timestamp so we don't get stuck in a loop
-                    $this->updateLastTimestamp($createdTime);
-                    echo "⚠️ Updated timestamp despite error to prevent loop\n";
+                    // Reply to the Reddit post with a comment
+                    $this->replyToPost($postId, "Floor '$floorName' has been created in the tower!", $postBody['link']);
+                } else {
+                    echo "No match found in this post title.\n";
                 }
             }
 
+            // Update the timestamp ONLY once at the end of processing to the newest post we've seen
+            // This ensures we don't miss any posts that came in while we were processing
+            if ($newestTimestamp > $lastTimestamp) {
+                echo "Updating last processed timestamp from " . date('Y-m-d H:i:s', $lastTimestamp) .
+                    " to " . date('Y-m-d H:i:s', $newestTimestamp) . "\n";
+                $this->updateLastTimestamp($newestTimestamp);
+            } else {
+                echo "No newer posts found than our last timestamp, keeping at: " . date('Y-m-d H:i:s', $lastTimestamp) . "\n";
+            }
         } catch (RequestException $e) {
             echo "❌ Error fetching posts: " . $e->getMessage() . "\n";
             if ($e->hasResponse()) {
@@ -263,168 +249,101 @@ class RedditBot
         }
     }
 
-
-    private function createWordPressPost($title, $content, $floorNumber, $authorId = null, $redditUsername = null)
+    public function monitorPrivateMessages()
     {
-        echo "Creating WordPress Floor post: '$title' with floor number $floorNumber...\n";
+        echo "Checking for new private messages...\n";
+
+        $lastPMTimestamp = $this->getLastPMTimestamp();
+        echo "Last processed PM timestamp: " . $lastPMTimestamp . " (" . date('Y-m-d H:i:s', $lastPMTimestamp) . ")\n";
+
         try {
-            // Use the Reddit post content for the WordPress post
-            $postContent = !empty($content) ? $content : "A new floor has been created: $title";
-
-            // Use the floor endpoint
-            $floorEndpoint = str_replace('/posts', '/floor', $this->wpUrl);
-
-            // Prepare post data
-            $postData = [
-                'title' => $title,
-                'content' => $postContent,
-                'status' => 'publish',
-                'floor_number' => $floorNumber,
-                'meta' => [
-                    '_floor_number' => $floorNumber
-                ]
-            ];
-
-            // Add author if provided
-            if ($authorId) {
-                $postData['author'] = (int) $authorId;
-                echo "Setting author ID to: $authorId\n";
-            }
-
-            echo "Post data being sent: " . json_encode($postData) . "\n";
-
-            // Create the post
-            $response = $this->client->post($floorEndpoint, [
-                'auth' => [$this->wpUser, $this->wpPassword],
+            // Get all messages (not just unread) and let timestamp filtering handle duplicates
+            $response = $this->client->get("https://oauth.reddit.com/message/inbox", [
                 'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json'
+                    'Authorization' => "Bearer {$this->accessToken}",
+                    'User-Agent' => $this->userAgent
                 ],
-                'json' => $postData
+                'query' => [
+                    'limit' => 25
+                ]
             ]);
 
-            // Decode response
-            $body = json_decode($response->getBody(), true);
+            $messages = json_decode($response->getBody(), true);
 
-            // If we got a post ID, proceed with additional steps
-            if (isset($body['id'])) {
-                $postId = $body['id'];
-                echo "✅ Successfully created Floor post with ID: $postId\n";
-
-                // Try updating the floor number meta directly
-                try {
-                    echo "Updating floor number meta directly...\n";
-                    $updateResponse = $this->client->post("https://www.thespiraltower.net/wp-json/wp/v2/floor/$postId", [
-                        'auth' => [$this->wpUser, $this->wpPassword],
-                        'headers' => [
-                            'Content-Type' => 'application/json',
-                            'Accept' => 'application/json'
-                        ],
-                        'json' => [
-                            'meta' => [
-                                '_floor_number' => $floorNumber
-                            ]
-                        ]
-                    ]);
-                } catch (\Exception $e) {
-                    echo "⚠️ Couldn't update meta directly: " . $e->getMessage() . "\n";
-                }
-
-                // Generate and upload image
-                echo "Starting image generation and upload process...\n";
-                $imageurl = $this->generateImageFromPrompt($postContent);
-
-                if (!empty($imageurl)) {
-                    $attachment_id = $this->uploadImageToWordPress($imageurl, $postId);
-                    if ($attachment_id) {
-                        echo "✅ Complete image workflow successful. Attachment ID: $attachment_id\n";
-                    } else {
-                        echo "⚠️ Image was generated but upload failed\n";
-                    }
-                } else {
-                    echo "⚠️ Image generation failed, skipping upload\n";
-                }
-
-                // Send notification (moved outside the meta update try/catch)
-                echo "✅ Sending notification to root88: $postId\n";
-                $this->sendRedditPrivateMessage(
-                    "root88",
-                    "Test Floor Created",
-                    "A new floor was created on The Spiral Tower:\n\n" .
-                    "Floor Number: $floorNumber\n" .
-                    "Title: $title\n" .
-                    "Created By: " . ($redditUsername ?: "Unknown") . "\n" .
-                    "WordPress User ID: " . ($authorId ?: "None") . "\n\n" .
-                    "Link: " . (isset($body['link']) ? $body['link'] : "Not available")
-                );
-
-                return $body;
-            } elseif (isset($body['code'])) {
-                echo "❌ WordPress API error: {$body['message']}\n";
-            } else {
-                echo "⚠️ Unexpected response format from WordPress\n";
+            if (!isset($messages['data']['children']) || empty($messages['data']['children'])) {
+                echo "No private messages found.\n";
+                return;
             }
-        } catch (\GuzzleHttp\Exception\RequestException $e) {
-            echo "❌ HTTP Request failed: " . $e->getMessage() . "\n";
+
+            $newestPMTimestamp = $lastPMTimestamp;
+
+            foreach ($messages['data']['children'] as $message) {
+                if (!isset($message['data'])) {
+                    continue;
+                }
+
+                $messageData = $message['data'];
+                $messageId = $messageData['id'];
+                $createdTime = $messageData['created_utc'];
+                $subject = isset($messageData['subject']) ? $messageData['subject'] : '';
+                $body = isset($messageData['body']) ? $messageData['body'] : '';
+                $author = isset($messageData['author']) ? $messageData['author'] : '';
+                $isComment = isset($messageData['was_comment']) ? $messageData['was_comment'] : false;
+
+                // Keep track of the newest message timestamp
+                if ($createdTime > $newestPMTimestamp) {
+                    $newestPMTimestamp = $createdTime;
+                }
+
+                // Skip if message was received before last processed time
+                if ($createdTime <= $lastPMTimestamp) {
+                    echo "Skipping message ID: $messageId (received at " . date('Y-m-d H:i:s', $createdTime) . ")\n";
+                    continue;
+                }
+
+                // Skip comment replies (we only want direct private messages)
+                if ($isComment) {
+                    echo "Skipping comment reply from $author\n";
+                    continue;
+                }
+
+                echo "Processing private message ID: $messageId from $author\n";
+                echo "Subject: $subject\n";
+                echo "Body: " . substr($body, 0, 100) . "...\n";
+
+                // Process commands
+                $this->processPrivateMessageCommand($author, $subject, $body, $messageId);
+            }
+
+            // Update the PM timestamp
+            if ($newestPMTimestamp > $lastPMTimestamp) {
+                echo "Updating last processed PM timestamp from " . date('Y-m-d H:i:s', $lastPMTimestamp) .
+                    " to " . date('Y-m-d H:i:s', $newestPMTimestamp) . "\n";
+                $this->updateLastPMTimestamp($newestPMTimestamp);
+            }
+
+        } catch (RequestException $e) {
+            echo "❌ Error fetching private messages: " . $e->getMessage() . "\n";
             if ($e->hasResponse()) {
                 echo "Response: " . $e->getResponse()->getBody() . "\n";
             }
         }
-
-        return null;
     }
-
-    private function checkChatMessages()
-    {
-        echo "Checking chat messages...\n";
-
-        try {
-            // Try the regular chat endpoint instead of mod endpoint
-            $response = $this->client->get("https://oauth.reddit.com/api/v1/sendbird/me", [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->accessToken}",
-                    'User-Agent' => $this->userAgent
-                ]
-            ]);
-
-            $chats = json_decode($response->getBody(), true);
-            echo "Chat response: " . json_encode($chats) . "\n";
-
-            // This endpoint might return different data structure
-            // We'll need to see what it returns to process it properly
-
-        } catch (RequestException $e) {
-            echo "❌ Error fetching chat messages: " . $e->getMessage() . "\n";
-            echo "Chat monitoring may not be available for this bot's permissions\n";
-            // Don't fail the whole process, just skip chat monitoring
-        }
-    }
-
-
-
     private function processPrivateMessageCommand($author, $subject, $body, $messageId)
     {
         // Normalize the message content for case-insensitive matching
         $normalizedSubject = strtolower(trim($subject));
         $normalizedBody = strtolower(trim($body));
 
-        echo "Debug: Processing command - Subject: '$normalizedSubject', Body: '$normalizedBody'\n";
-
-        // Check for "Create Account" command in subject OR body
-        if (
-            strpos($normalizedSubject, 'create account') !== false ||
-            strpos($normalizedBody, 'create account') !== false
-        ) {
+        // Check for "Create Account" command
+        if ($normalizedSubject === 'create account' || $normalizedBody === 'create account') {
             echo "Processing 'Create Account' command from $author\n";
             $this->handleCreateAccountCommand($author);
             return;
         }
 
-        // Check for "Reset Password" command in subject OR body
-        if (
-            strpos($normalizedSubject, 'reset password') !== false ||
-            strpos($normalizedBody, 'reset password') !== false
-        ) {
+        // Check for "Reset Password" command
+        if ($normalizedSubject === 'reset password' || $normalizedBody === 'reset password') {
             echo "Processing 'Reset Password' command from $author\n";
             $this->handleResetPasswordCommand($author);
             return;
@@ -432,7 +351,6 @@ class RedditBot
 
         echo "No recognized command found in message from $author\n";
     }
-
     private function handleCreateAccountCommand($redditUsername)
     {
         echo "Handling create account request for $redditUsername\n";
@@ -644,62 +562,126 @@ class RedditBot
         }
     }
 
-    private function createWordPressUser($redditUsername)
+    private function createWordPressPost($title, $content, $floorNumber, $authorId = null, $redditUsername = null)
     {
-        echo "Creating new WordPress user for Reddit user '$redditUsername'...\n";
-        // Use the Reddit username in lowercase and remove underscores for WordPress
-        $username = strtolower(str_replace('_', '', $redditUsername));
-        echo "Using sanitized username: '$username' (from Reddit: '$redditUsername')\n";
-        // Generate a random password
-        $password = $this->generateRandomPassword(12);
+        echo "Creating WordPress Floor post: '$title' with floor number $floorNumber...\n";
         try {
-            $response = $this->client->post("https://www.thespiraltower.net/wp-json/wp/v2/users", [
+            // Use the Reddit post content for the WordPress post
+            $postContent = !empty($content) ? $content : "A new floor has been created: $title";
+
+            // Use the floor endpoint
+            $floorEndpoint = str_replace('/posts', '/floor', $this->wpUrl);
+
+            // Prepare post data
+            $postData = [
+                'title' => $title,
+                'content' => $postContent,
+                'status' => 'publish',
+                // We'll try both approaches to set the floor number
+                'floor_number' => $floorNumber,
+                'meta' => [
+                    '_floor_number' => $floorNumber
+                ]
+            ];
+
+            // Add author if provided
+            if ($authorId) {
+                $postData['author'] = (int) $authorId;
+                echo "Setting author ID to: $authorId\n";
+            }
+
+            echo "Post data being sent: " . json_encode($postData) . "\n";
+
+            // Create the post
+            $response = $this->client->post($floorEndpoint, [
                 'auth' => [$this->wpUser, $this->wpPassword],
                 'headers' => [
                     'Content-Type' => 'application/json',
                     'Accept' => 'application/json'
                 ],
-                'json' => [
-                    'username' => $username,
-                    'email' => $username . "@thespiraltower.net",
-                    'password' => $password,
-                    'roles' => ['floor_author'],
-                ],
-                'http_errors' => false
+                'json' => $postData
             ]);
-            $statusCode = $response->getStatusCode();
-            $responseBody = (string) $response->getBody();
-            if ($statusCode === 201 || $statusCode === 200) {
-                $user = json_decode($responseBody, true);
-                if (isset($user['id'])) {
-                    echo "✅ User account created for '$redditUsername' with ID: {$user['id']}\n";
-                    // Send the Reddit user their credentials
-                    $message = "Hello! Your account has been created on The Spiral Tower.\n\n" .
-                        "Username: $username\n" .
-                        "Password: $password\n\n" .
-                        "You can log in at https://www.thespiraltower.net/wp-login.php\n\n";
-                    // Only mention username changes if there actually were underscores
-                    if (strpos($redditUsername, '_') !== false) {
-                        $message .= "Note: Your WordPress username has underscores removed as they're not allowed in WordPress usernames.\n" .
-                            "Reddit Username: $redditUsername\n" .
-                            "WordPress Username: $username\n\n";
+
+            // Decode response
+            $body = json_decode($response->getBody(), true);
+
+            // If we got a post ID, check if everything worked
+            if (isset($body['id'])) {
+                $postId = $body['id'];
+                echo "✅ Successfully created Floor post with ID: $postId\n";
+
+                // Try updating the floor number directly using meta
+                try {
+                    echo "Updating floor number meta directly...\n";
+                    $updateResponse = $this->client->post("https://www.thespiraltower.net/wp-json/wp/v2/floor/$postId", [
+                        'auth' => [$this->wpUser, $this->wpPassword],
+                        'headers' => [
+                            'Content-Type' => 'application/json',
+                            'Accept' => 'application/json'
+                        ],
+                        'json' => [
+                            'meta' => [
+                                '_floor_number' => $floorNumber
+                            ]
+                        ]
+                    ]);
+
+                    //// Debugging
+                    // $updateBody = json_decode($updateResponse->getBody(), true);
+                    // echo "Meta update response: " . json_encode($updateBody) . "\n";
+
+
+
+                    echo "Starting image generation and upload process...\n";
+
+                    $imageurl = $this->generateImageFromPrompt($postContent);
+
+                    if (!empty($imageurl)) {
+                        $attachment_id = $this->uploadImageToWordPress($imageurl, $postId);
+
+                        if ($attachment_id) {
+                            echo "✅ Complete image workflow successful. Attachment ID: $attachment_id\n";
+                        } else {
+                            echo "⚠️ Image was generated but upload failed\n";
+                        }
+                    } else {
+                        echo "⚠️ Image generation failed, skipping upload\n";
                     }
-                    $message .= "You now have author privileges on the site and can create new content!";
-                    $this->sendRedditPrivateMessage(
-                        $redditUsername,
-                        "Your Spiral Tower Account",
-                        $message
-                    );
-                    return $user['id'];
+
+                    if (isset($body['id'])) {
+                        $postId = $body['id'];
+                        echo "✅ sendRedditPrivateMessage root88: $postId\n";
+                        // Send notification to root88 for testing
+                        $this->sendRedditPrivateMessage(
+                            "root88",
+                            "Test Floor Created",
+                            "A new floor was created on The Spiral Tower:\n\n" .
+                            "Floor Number: $floorNumber\n" .
+                            "Title: $title\n" .
+                            "Created By: " . ($redditUsername ?: "Unknown") . "\n" .
+                            "WordPress User ID: " . ($authorId ?: "None") . "\n\n" .
+                            "Link: " . (isset($body['link']) ? $body['link'] : "Not available")
+                        );
+                        return $body;
+                    }
+                } catch (\Exception $e) {
+                    echo "⚠️ Couldn't update meta directly: " . $e->getMessage() . "\n";
                 }
+
+                return $body;
+            } elseif (isset($body['code'])) {
+                echo "❌ WordPress API error: {$body['message']}\n";
             } else {
-                echo "❌ Failed to create user account. Status: $statusCode, Response: $responseBody\n";
+                echo "⚠️ Unexpected response format from WordPress\n";
             }
-            return false;
-        } catch (\Exception $e) {
-            echo "❌ Error creating WordPress user: " . $e->getMessage() . "\n";
-            return false;
+        } catch (\GuzzleHttp\Exception\RequestException $e) {
+            echo "❌ HTTP Request failed: " . $e->getMessage() . "\n";
+            if ($e->hasResponse()) {
+                echo "Response: " . $e->getResponse()->getBody() . "\n";
+            }
         }
+
+        return null;  // Return null if something fails
     }
 
     private function floorNumberExists($floorNumber)
@@ -729,645 +711,6 @@ class RedditBot
         }
     }
 
-    /**
-     * SAFETY CHECK: Get the last processed comment timestamp
-     */
-    private function getLastCommentTimestamp()
-    {
-        // Safety check for missing property
-        if (empty($this->lastProcessedCommentFile)) {
-            echo "⚠️ Comment file property not set, using default filename\n";
-            $this->lastProcessedCommentFile = 'last_processed_comment_timestamp.txt';
-        }
-
-        $filePath = __DIR__ . '/' . $this->lastProcessedCommentFile;
-        echo "Looking for comment timestamp file at: $filePath\n";
-        echo "Filename property: '{$this->lastProcessedCommentFile}'\n";
-        echo "Directory: " . __DIR__ . "\n";
-
-        if (!file_exists($filePath)) {
-            echo "⚠️ Comment timestamp file not found. Creating initial file with current timestamp.\n";
-
-            $currentTime = time();
-            $result = file_put_contents($filePath, $currentTime);
-
-            if ($result === false) {
-                echo "❌ Failed to create initial timestamp file. Check permissions on directory: " . __DIR__ . "\n";
-                return 0;
-            } else {
-                echo "✅ Created initial timestamp file with value: $currentTime (" . date('Y-m-d H:i:s', $currentTime) . ")\n";
-                return $currentTime;
-            }
-        }
-
-        $timestamp = file_get_contents($filePath);
-        echo "Raw file contents: '" . var_export($timestamp, true) . "'\n";
-        echo "File size: " . filesize($filePath) . " bytes\n";
-
-        if ($timestamp === false) {
-            echo "❌ Failed to read timestamp file\n";
-            return 0;
-        }
-
-        $timestamp = trim($timestamp);
-        echo "Trimmed timestamp: '$timestamp'\n";
-
-        if (!is_numeric($timestamp) || (int) $timestamp <= 0) {
-            echo "⚠️ Invalid timestamp in file: '$timestamp'. Using current time.\n";
-            $currentTime = time();
-            file_put_contents($filePath, $currentTime);
-            echo "✅ Reset timestamp file to: $currentTime\n";
-            return $currentTime;
-        }
-
-        $timestampInt = (int) $timestamp;
-        echo "Valid timestamp found: $timestampInt (" . date('Y-m-d H:i:s', $timestampInt) . ")\n";
-        return $timestampInt;
-    }
-
-    /**
-     * SAFETY CHECK: Update timestamp with safety check
-     */
-    private function updateLastCommentTimestamp($timestamp)
-    {
-        // Safety check for missing property
-        if (empty($this->lastProcessedCommentFile)) {
-            echo "⚠️ Comment file property not set, using default filename\n";
-            $this->lastProcessedCommentFile = 'last_processed_comment_timestamp.txt';
-        }
-
-        if (!is_numeric($timestamp) || $timestamp <= 0) {
-            echo "⚠️ Invalid comment timestamp value: $timestamp. Not updating.\n";
-            return;
-        }
-
-        $filePath = __DIR__ . '/' . $this->lastProcessedCommentFile;
-        echo "Writing timestamp $timestamp to file: $filePath\n";
-
-        $result = file_put_contents($filePath, (string) $timestamp, LOCK_EX);
-
-        if ($result === false) {
-            echo "❌ Failed to write comment timestamp to file.\n";
-        } else {
-            echo "✅ Successfully wrote $result bytes to timestamp file\n";
-
-            // Verify the write
-            $verification = file_get_contents($filePath);
-            echo "Verification read: '$verification'\n";
-        }
-    }
-
-    /**
-     * Monitor comments with better duplicate prevention
-     */
-    public function monitorComments()
-    {
-        echo "Checking for new comments with /create room requests...\n";
-
-        $lastCommentTimestamp = $this->getLastCommentTimestamp();
-        echo "Starting comment processing from timestamp: " . $lastCommentTimestamp . " (" . date('Y-m-d H:i:s', $lastCommentTimestamp) . ")\n";
-
-        try {
-            // Get recent comments from the subreddit
-            $response = $this->client->get("https://oauth.reddit.com/r/{$this->subreddit}/comments", [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->accessToken}",
-                    'User-Agent' => $this->userAgent
-                ],
-                'query' => [
-                    'limit' => 100
-                ]
-            ]);
-
-            $comments = json_decode($response->getBody(), true);
-
-            if (!isset($comments['data']['children']) || empty($comments['data']['children'])) {
-                echo "No comments found. Nothing to do.\n";
-                return;
-            }
-
-            $newestCommentTimestamp = $lastCommentTimestamp;
-            $roomRequestsFound = 0;
-            $processedComments = 0;
-
-            foreach ($comments['data']['children'] as $comment) {
-                if (!isset($comment['data'])) {
-                    continue;
-                }
-
-                $commentData = $comment['data'];
-                $commentId = $commentData['id'];
-                $createdTime = $commentData['created_utc'];
-                $commentBody = isset($commentData['body']) ? $commentData['body'] : '';
-                $commentAuthor = isset($commentData['author']) ? $commentData['author'] : '';
-                $parentId = isset($commentData['link_id']) ? str_replace('t3_', '', $commentData['link_id']) : '';
-
-                // Keep track of the newest comment timestamp regardless of whether we process it
-                if ($createdTime > $newestCommentTimestamp) {
-                    $newestCommentTimestamp = $createdTime;
-                }
-
-                // Skip if comment was created before last processed time
-                if ($createdTime <= $lastCommentTimestamp) {
-                    continue;
-                }
-
-                $processedComments++;
-
-                // ONLY process room creation requests
-                if (preg_match("/^\/create room\s+(.+)/i", trim($commentBody), $matches)) {
-                    $roomRequestsFound++;
-                    $roomName = trim($matches[1]);
-
-                    echo "\n=== PROCESSING ROOM REQUEST #$roomRequestsFound ===\n";
-                    echo "Comment ID: $commentId from $commentAuthor\n";
-                    echo "Created: " . date('Y-m-d H:i:s', $createdTime) . " (timestamp: $createdTime)\n";
-                    echo "Room Name: '$roomName'\n";
-
-                    try {
-                        // Get the parent post to verify it's a floor creation post
-                        $parentPost = $this->getPostById($parentId);
-                        if (!$parentPost) {
-                            echo "❌ Could not find parent post with ID: $parentId\n";
-                            continue;
-                        }
-
-                        $parentTitle = $parentPost['title'];
-                        $parentAuthor = $parentPost['author'];
-
-                        echo "Parent post: '$parentTitle' by $parentAuthor\n";
-
-                        // Check if parent post is a [New Floor] post and if the commenter is the original author
-                        if (!preg_match("/^\[New Floor\]/i", $parentTitle)) {
-                            echo "⚠️ Parent post is not a [New Floor] post, skipping\n";
-                            continue;
-                        }
-
-                        if ($commentAuthor !== $parentAuthor) {
-                            echo "⚠️ Comment author ($commentAuthor) is not the same as post author ($parentAuthor), skipping\n";
-                            $this->replyToComment($commentId, "Sorry, only the creator of the floor can add rooms to it.");
-                            continue;
-                        }
-
-                        // Find the WordPress floor ID for this Reddit post
-                        $floorId = $this->findFloorByRedditPost($parentTitle, $parentAuthor);
-                        if (!$floorId) {
-                            echo "❌ Could not find WordPress floor for this Reddit post\n";
-                            $this->replyToComment($commentId, "Sorry, I couldn't find the corresponding floor in the tower. Working on a fix...");
-                            continue;
-                        }
-
-                        echo "✅ Found WordPress floor ID: $floorId\n";
-
-                        // Create the room and portals
-                        $this->createRoomWithPortals($floorId, $roomName, $commentAuthor, $commentId);
-
-                    } catch (\Exception $e) {
-                        echo "❌ Error processing comment $commentId: " . $e->getMessage() . "\n";
-
-                        $errorMessage = "❌ ERROR processing Reddit comment:\n\n" .
-                            "Comment ID: $commentId\n" .
-                            "Author: $commentAuthor\n" .
-                            "Body: $commentBody\n" .
-                            "Error: " . $e->getMessage() . "\n" .
-                            "File: " . $e->getFile() . "\n" .
-                            "Line: " . $e->getLine() . "\n\n" .
-                            "Timestamp: " . date('Y-m-d H:i:s');
-
-                        $this->sendRedditPrivateMessage(
-                            "root88",
-                            "Bot Error - Comment Processing Failed",
-                            $errorMessage
-                        );
-                    }
-                    echo "=== END ROOM REQUEST PROCESSING ===\n\n";
-                }
-            }
-
-            echo "Summary: Processed $processedComments new comments, found $roomRequestsFound room requests\n";
-
-            // ALWAYS update the timestamp to prevent reprocessing, even if no room requests found
-            if ($newestCommentTimestamp > $lastCommentTimestamp) {
-                echo "Updating comment timestamp from " . date('Y-m-d H:i:s', $lastCommentTimestamp) .
-                    " to " . date('Y-m-d H:i:s', $newestCommentTimestamp) . "\n";
-                $this->updateLastCommentTimestamp($newestCommentTimestamp);
-            } else {
-                echo "No newer comments found, timestamp remains at " . date('Y-m-d H:i:s', $lastCommentTimestamp) . "\n";
-            }
-
-        } catch (RequestException $e) {
-            echo "❌ Error fetching comments: " . $e->getMessage() . "\n";
-            if ($e->hasResponse()) {
-                echo "Response: " . $e->getResponse()->getBody() . "\n";
-            }
-        }
-    }
-
-    /**
-     *Get a Reddit post by ID
-     */
-    private function getPostById($postId)
-    {
-        try {
-            $response = $this->client->get("https://oauth.reddit.com/r/{$this->subreddit}/comments/{$postId}", [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->accessToken}",
-                    'User-Agent' => $this->userAgent
-                ]
-            ]);
-
-            $data = json_decode($response->getBody(), true);
-
-            if (isset($data[0]['data']['children'][0]['data'])) {
-                $postData = $data[0]['data']['children'][0]['data'];
-                return [
-                    'title' => $postData['title'],
-                    'author' => $postData['author'],
-                    'selftext' => $postData['selftext'] ?? '',
-                    'created_utc' => $postData['created_utc']
-                ];
-            }
-
-            return null;
-        } catch (RequestException $e) {
-            echo "❌ Error fetching post $postId: " . $e->getMessage() . "\n";
-            return null;
-        }
-    }
-
-    /**
-     *Find WordPress floor ID by Reddit post details
-     */
-    private function findFloorByRedditPost($title, $author)
-    {
-        // Extract floor number and name from title
-        if (preg_match("/^\[New Floor\]\s*\[([^\]]*)\](.*)/i", $title, $matches)) {
-            $floorNumber = trim($matches[1]);
-            $floorName = trim($matches[2]);
-
-            echo "Looking for floor: Number='$floorNumber', Name='$floorName', Author='$author'\n";
-
-            try {
-                // Search for floors by title and author
-                $sanitizedAuthor = strtolower(str_replace('_', '', $author));
-
-                $response = $this->client->get("https://www.thespiraltower.net/wp-json/wp/v2/floor", [
-                    'auth' => [$this->wpUser, $this->wpPassword],
-                    'query' => [
-                        'search' => $floorName,
-                        'per_page' => 50
-                    ]
-                ]);
-
-                $floors = json_decode($response->getBody(), true);
-
-                foreach ($floors as $floor) {
-                    // Check if this floor matches our criteria
-                    $floorTitle = $floor['title']['rendered'];
-                    $floorAuthorId = $floor['author'];
-
-                    // Get author username
-                    $authorResponse = $this->client->get("https://www.thespiraltower.net/wp-json/wp/v2/users/{$floorAuthorId}", [
-                        'auth' => [$this->wpUser, $this->wpPassword]
-                    ]);
-                    $authorData = json_decode($authorResponse->getBody(), true);
-                    $wpUsername = strtolower($authorData['slug']);
-
-                    // Check if titles match and authors match
-                    if (stripos($floorTitle, $floorName) !== false && $wpUsername === $sanitizedAuthor) {
-                        // If we have a floor number, verify it matches
-                        if (!empty($floorNumber) && is_numeric($floorNumber)) {
-                            $floorMeta = $this->getFloorMeta($floor['id']);
-                            if ($floorMeta['floor_number'] != $floorNumber) {
-                                continue;
-                            }
-                        }
-
-                        echo "✅ Found matching floor: ID {$floor['id']}\n";
-                        return $floor['id'];
-                    }
-                }
-
-            } catch (\Exception $e) {
-                echo "❌ Error searching for floor: " . $e->getMessage() . "\n";
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     *Get floor meta data
-     */
-    private function getFloorMeta($floorId)
-    {
-        try {
-            $response = $this->client->get("https://www.thespiraltower.net/wp-json/wp/v2/floor/{$floorId}", [
-                'auth' => [$this->wpUser, $this->wpPassword]
-            ]);
-
-            $floor = json_decode($response->getBody(), true);
-            return [
-                'floor_number' => $floor['floor_number'] ?? '',
-                'title' => $floor['title']['rendered'] ?? ''
-            ];
-        } catch (\Exception $e) {
-            echo "❌ Error getting floor meta: " . $e->getMessage() . "\n";
-            return [];
-        }
-    }
-
-
-
-    /**
-     * Get floor name for portal naming
-     */
-    private function getFloorName($floorId)
-    {
-        try {
-            $response = $this->client->get("https://www.thespiraltower.net/wp-json/wp/v2/floor/{$floorId}", [
-                'auth' => [$this->wpUser, $this->wpPassword]
-            ]);
-
-            $floor = json_decode($response->getBody(), true);
-
-            if (isset($floor['title']['rendered'])) {
-                return $floor['title']['rendered'];
-            }
-
-            // Fallback
-            return "Floor";
-
-        } catch (\Exception $e) {
-            echo "⚠️ Error getting floor name: " . $e->getMessage() . "\n";
-            return "Floor";
-        }
-    }
-
-    /**
-     * FIXED: Create room with portals (all improvements)
-     */
-    private function createRoomWithPortals($floorId, $roomName, $redditUsername, $commentId)
-    {
-        echo "Creating room '$roomName' on floor $floorId for user $redditUsername...\n";
-
-        // Get or create WordPress user
-        $authorId = $this->checkUserExists($redditUsername);
-        if (!$authorId) {
-            echo "⚠️ WordPress user not found for $redditUsername, using ID 1 and notifying root88\n";
-            $authorId = 1;
-
-            $this->sendRedditPrivateMessage(
-                "root88",
-                "Room Creation - User Not Found",
-                "Room creation attempted by Reddit user '$redditUsername' but no WordPress user found.\n\n" .
-                "Room: '$roomName'\n" .
-                "Floor ID: $floorId\n" .
-                "Room was assigned to user ID 1."
-            );
-        }
-
-        try {
-            // Get floor name for the return portal
-            $floorName = $this->getFloorName($floorId);
-
-            // Create the room
-            $roomData = [
-                'title' => $roomName,
-                'content' => '', // Empty content as requested
-                'status' => 'publish',
-                'author' => (int) $authorId,
-                'meta' => [
-                    '_room_floor_id' => $floorId,
-                    '_room_type' => 'normal'
-                ]
-            ];
-
-            $response = $this->client->post("https://www.thespiraltower.net/wp-json/wp/v2/room", [
-                'auth' => [$this->wpUser, $this->wpPassword],
-                'headers' => [
-                    'Content-Type' => 'application/json',
-                    'Accept' => 'application/json'
-                ],
-                'json' => $roomData
-            ]);
-
-            $roomResult = json_decode($response->getBody(), true);
-
-            if (!isset($roomResult['id'])) {
-                throw new Exception("Failed to create room: " . json_encode($roomResult));
-            }
-
-            $roomId = $roomResult['id'];
-            echo "✅ Successfully created room with ID: $roomId\n";
-
-            // FIXED: Set room floor ID using the REST API fields from Room Manager
-            try {
-                echo "Setting room floor ID using REST API fields...\n";
-                $updateResponse = $this->client->post("https://www.thespiraltower.net/wp-json/wp/v2/room/$roomId", [
-                    'auth' => [$this->wpUser, $this->wpPassword],
-                    'headers' => [
-                        'Content-Type' => 'application/json',
-                        'Accept' => 'application/json'
-                    ],
-                    'json' => [
-                        'floor_id' => (int) $floorId,  // Uses the REST field from Room Manager
-                        'room_type' => 'normal'       // Uses the REST field from Room Manager
-                    ]
-                ]);
-
-                $updateResult = json_decode($updateResponse->getBody(), true);
-                echo "✅ Room meta update successful\n";
-            } catch (\Exception $e) {
-                echo "⚠️ Couldn't update room meta, trying direct meta approach: " . $e->getMessage() . "\n";
-
-                // Fallback to direct meta update
-                $fallbackResponse = $this->client->post("https://www.thespiraltower.net/wp-json/wp/v2/room/$roomId", [
-                    'auth' => [$this->wpUser, $this->wpPassword],
-                    'headers' => [
-                        'Content-Type' => 'application/json',
-                        'Accept' => 'application/json'
-                    ],
-                    'json' => [
-                        'meta' => [
-                            '_room_floor_id' => (string) $floorId,
-                            '_room_type' => 'normal'
-                        ]
-                    ]
-                ]);
-            }
-
-            // FIXED: Create floor → room portal (invisible with proper origin/destination)
-            $floorToRoomPortalId = $this->createPortal(
-                $roomName, // Just the room name
-                'floor',
-                $floorId,
-                'room',
-                $roomId,
-                'invisible', // FIXED: Set to invisible
-                $authorId
-            );
-
-            // FIXED: Create room → floor portal (invisible with proper origin/destination)
-            $roomToFloorPortalId = $this->createPortal(
-                $floorName, // Just the floor name
-                'room',
-                $roomId,
-                'floor',
-                $floorId,
-                'invisible', // FIXED: Set to invisible (was text)
-                $authorId
-            );
-
-            // NEW: Generate and upload image for the room
-            echo "Starting image generation and upload process for room...\n";
-            $imagePrompt = "make super interesting digital art like an unreal engine master. it should have lots of intricate unique details, beautiful lighting and vibrant color schemes. It should be an image of " . $roomName;
-            $imageurl = $this->generateImageFromPrompt($imagePrompt);
-
-            if (!empty($imageurl)) {
-                $attachment_id = $this->uploadImageToWordPress($imageurl, $roomId);
-                if ($attachment_id) {
-                    echo "✅ Complete image workflow successful for room. Attachment ID: $attachment_id\n";
-                } else {
-                    echo "⚠️ Room image was generated but upload failed\n";
-                }
-            } else {
-                echo "⚠️ Room image generation failed, skipping upload\n";
-            }
-
-            // Reply to the Reddit comment
-            $roomUrl = isset($roomResult['link']) ? $roomResult['link'] : "https://www.thespiraltower.net/room/";
-            $this->replyToComment($commentId, "Room '$roomName' has been created! You can access it here: $roomUrl");
-
-            // REMOVED: No longer sending private message to user since we commented
-
-            // Notify root88
-            $this->sendRedditPrivateMessage(
-                "root88",
-                "Room Created Successfully",
-                "A new room was created:\n\n" .
-                "Room: '$roomName' (ID: $roomId)\n" .
-                "Floor: '$floorName' (ID: $floorId)\n" .
-                "Created By: $redditUsername\n" .
-                "WordPress User ID: $authorId\n" .
-                "Floor→Room Portal ID: $floorToRoomPortalId (title: '$roomName', invisible)\n" .
-                "Room→Floor Portal ID: $roomToFloorPortalId (title: '$floorName', invisible)\n" .
-                "Image Generated: " . (!empty($imageurl) ? "Yes" : "No") . "\n\n" .
-                "Link: $roomUrl"
-            );
-
-        } catch (\Exception $e) {
-            echo "❌ Error creating room: " . $e->getMessage() . "\n";
-
-            $this->replyToComment($commentId, "Sorry, there was an error creating your room. Working on a fix...");
-
-            $this->sendRedditPrivateMessage(
-                "root88",
-                "Room Creation Failed",
-                "Failed to create room '$roomName' for user $redditUsername on floor $floorId.\n\n" .
-                "Error: " . $e->getMessage()
-            );
-
-            throw $e;
-        }
-    }
-
-    /**
-     * CLEAN: Create a portal using portal_settings (requires Portal Manager update)
-     */
-    private function createPortal($title, $originType, $originId, $destinationType, $destinationId, $portalType, $authorId)
-    {
-        echo "Creating portal '$title' ($originType → $destinationType, type: $portalType)\n";
-
-        // Build portal settings
-        $portalSettings = [
-            'portal_type' => $portalType,
-            'position_x' => '50',
-            'position_y' => '50',
-            'scale' => '100',
-            'disable_pointer' => false,
-            'disable_tooltip' => false,
-            'use_custom_size' => false,
-            'origin_type' => $originType,
-            'destination_type' => $destinationType
-        ];
-
-        // Set origin and destination IDs
-        if ($originType === 'floor') {
-            $portalSettings['origin_floor_id'] = (string) $originId;
-            $portalSettings['origin_room_id'] = '';
-        } else {
-            $portalSettings['origin_room_id'] = (string) $originId;
-            $portalSettings['origin_floor_id'] = '';
-        }
-
-        if ($destinationType === 'floor') {
-            $portalSettings['destination_floor_id'] = (string) $destinationId;
-            $portalSettings['destination_room_id'] = '';
-        } else {
-            $portalSettings['destination_room_id'] = (string) $destinationId;
-            $portalSettings['destination_floor_id'] = '';
-        }
-
-        // Create portal with settings
-        $portalData = [
-            'title' => $title,
-            'status' => 'publish',
-            'author' => (int) $authorId,
-            'portal_settings' => $portalSettings
-        ];
-
-        echo "Creating portal with settings: " . json_encode($portalSettings) . "\n";
-
-        $response = $this->client->post("https://www.thespiraltower.net/wp-json/wp/v2/portal", [
-            'auth' => [$this->wpUser, $this->wpPassword],
-            'headers' => [
-                'Content-Type' => 'application/json',
-                'Accept' => 'application/json'
-            ],
-            'json' => $portalData
-        ]);
-
-        $portalResult = json_decode($response->getBody(), true);
-
-        if (!isset($portalResult['id'])) {
-            throw new Exception("Failed to create portal '$title': " . json_encode($portalResult));
-        }
-
-        $portalId = $portalResult['id'];
-        echo "✅ Successfully created portal '$title' with ID: $portalId\n";
-
-        return $portalId;
-    }
-
-
-    /**
-     * Reply to a Reddit comment
-     */
-    private function replyToComment($commentId, $message)
-    {
-        echo "Replying to comment ID: $commentId...\n";
-        try {
-            $response = $this->client->post("https://oauth.reddit.com/api/comment", [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->accessToken}",
-                    'User-Agent' => $this->userAgent
-                ],
-                'form_params' => [
-                    'thing_id' => "t1_$commentId", // 't1_' is the prefix for comments
-                    'text' => $message
-                ]
-            ]);
-
-            echo "✅ Reply sent to comment ID: $commentId\n";
-        } catch (RequestException $e) {
-            echo "❌ Error replying to comment: " . $e->getMessage() . "\n";
-            if ($e->hasResponse()) {
-                echo "Response: " . $e->getResponse()->getBody() . "\n";
-            }
-        }
-    }
-
     private function generateImageFromPrompt($prompt)
     {
         echo "Generating image for prompt: " . substr($prompt, 0, 50) . "...\n";
@@ -1375,56 +718,17 @@ class RedditBot
         // Enhance prompt for better image generation
         $prompt = $prompt . ' ' . $this->additionalImagePromptText;
 
-        // Prepare request body to match the successful curl format
-        $requestBody = [
-            'prompt' => $prompt,
-            'n' => 1,
-            'size' => '1024x1024'
-        ];
+        // Use the WordPress plugin's image generator (respects plugin settings)
+        $generator = new Spiral_Tower_Image_Generator();
+        $result = $generator->generate_image_from_api($prompt);
 
-        echo "Sending request to OpenAI URL: {$this->openAiUrl}\n";
-        echo "Request body: " . json_encode($requestBody) . "\n";
-
-        $response = wp_remote_post($this->openAiUrl, [
-            'headers' => [
-                'Content-Type' => 'application/json',
-                'api-key' => $this->openAiKey,
-            ],
-            'body' => json_encode($requestBody),
-            'timeout' => 60, // Increase timeout for image generation
-        ]);
-
-        if (is_wp_error($response)) {
-            echo "❌ Image generation failed: " . $response->get_error_message() . "\n";
+        if (is_wp_error($result)) {
+            echo "❌ Image generation failed: " . $result->get_error_message() . "\n";
             return null;
         }
 
-        $status_code = wp_remote_retrieve_response_code($response);
-        $body = wp_remote_retrieve_body($response);
-
-        echo "Response status code: $status_code\n";
-
-        // Log detailed error information if the response code isn't successful
-        if ($status_code < 200 || $status_code >= 300) {
-            echo "❌ API request failed with status code: $status_code\n";
-            echo "Response body: " . $body . "\n";
-            return null;
-        }
-
-        // Print the full response body for debugging
-        echo "Full response body: " . $body . "\n";
-
-        $decoded_body = json_decode($body, true);
-
-        if (!isset($decoded_body['data'][0]['url'])) {
-            echo "❌ No image URL found in the response.\n";
-            return null;
-        }
-
-        $url = $decoded_body['data'][0]['url'];
-        echo "✅ Image generated successfully. URL: " . $url . "\n";
-
-        return $url;
+        echo "✅ Image generated successfully. URL: " . $result['url'] . "\n";
+        return $result['url'];
     }
 
     private function debugOpenAIAPI()
@@ -2004,7 +1308,7 @@ class RedditBot
         // Convert to lowercase and remove underscores since WordPress usernames are stored this way
         $sanitizedUsername = strtolower(str_replace('_', '', $username));
         echo "Checking if WordPress user '$username' (sanitized: '$sanitizedUsername') exists...\n";
-
+    
         try {
             $response = $this->client->get("https://www.thespiraltower.net/wp-json/wp/v2/users", [
                 'auth' => [$this->wpUser, $this->wpPassword],
@@ -2023,7 +1327,7 @@ class RedditBot
                     // Check both slug and username, both in lowercase
                     $userSlug = isset($user['slug']) ? strtolower($user['slug']) : '';
                     $userName = isset($user['username']) ? strtolower($user['username']) : '';
-
+    
                     if ($userSlug === $sanitizedUsername || $userName === $sanitizedUsername) {
                         echo "✅ User '$username' found with ID: {$user['id']} (WordPress username: '{$user['username']}')\n";
                         return $user['id'];
@@ -2037,57 +1341,86 @@ class RedditBot
             return false;
         }
     }
+    
 
-
-
+    private function createWordPressUser($redditUsername)
+    {
+        echo "Creating new WordPress user for Reddit user '$redditUsername'...\n";
+    
+        // Use the Reddit username in lowercase and remove underscores for WordPress
+        $username = strtolower(str_replace('_', '', $redditUsername));
+        echo "Using sanitized username: '$username' (from Reddit: '$redditUsername')\n";
+    
+        // Generate a random password
+        $password = $this->generateRandomPassword(12);
+    
+        try {
+            $response = $this->client->post("https://www.thespiraltower.net/wp-json/wp/v2/users", [
+                'auth' => [$this->wpUser, $this->wpPassword],
+                'headers' => [
+                    'Content-Type' => 'application/json',
+                    'Accept' => 'application/json'
+                ],
+                'json' => [
+                    'username' => $username,
+                    'email' => $username . "@thespiraltower.net",
+                    'password' => $password,
+                    'roles' => ['floor_author'],
+                ],
+                'http_errors' => false
+            ]);
+    
+            $statusCode = $response->getStatusCode();
+            $responseBody = (string) $response->getBody();
+    
+            if ($statusCode === 201 || $statusCode === 200) {
+                $user = json_decode($responseBody, true);
+    
+                if (isset($user['id'])) {
+                    echo "✅ User account created for '$redditUsername' with ID: {$user['id']}\n";
+    
+                    // Send the Reddit user their credentials
+                    $this->sendRedditPrivateMessage(
+                        $redditUsername,
+                        "Your Spiral Tower Account",
+                        "Hello! Your account has been created on The Spiral Tower.\n\n" .
+                        "Reddit Username: $redditUsername\n" .
+                        "WordPress Username: $username\n" .
+                        "Password: $password\n\n" .
+                        "You can log in at https://www.thespiraltower.net/wp-login.php\n\n" .
+                        "Note: Your WordPress username has underscores removed as they're not allowed.\n\n" .
+                        "You now have author privileges on the site and can create new content!"
+                    );
+    
+                    return $user['id'];
+                }
+            } else {
+                echo "❌ Failed to create user account. Status: $statusCode, Response: $responseBody\n";
+            }
+    
+            return false;
+        } catch (\Exception $e) {
+            echo "❌ Error creating WordPress user: " . $e->getMessage() . "\n";
+            return false;
+        }
+    }
 
     private function generateRandomPassword($length = 12)
     {
         $words = [
-            'ceiling',
-            'pancakes',
-            'floor',
-            'pizza',
-            'spiral',
-            'tower',
-            'dagger',
-            'robe',
-            'sacrifice',
-            'blood',
-            'towerling',
-            'dream',
-            'dungeon',
-            'alter',
-            'cult',
-            'koolaid',
-            'library',
-            'dark',
-            'light',
-            'knife',
-            'towel',
-            'wumpus',
-            'potion',
-            'lore',
-            'traveler',
-            'arcade',
-            'diamond',
-            'gold',
-            'coin',
-            'ring',
-            'cat',
-            'sexy',
-            'portal',
-            'axe',
-            'flush',
-            'scroll'
+            'ceiling', 'pancakes', 'floor', 'pizza', 'spiral', 'tower', 'dagger', 'robe', 
+            'sacrifice', 'blood', 'towerling', 'dream', 'dungeon', 'alter', 'cult', 
+            'koolaid', 'library', 'dark', 'light', 'knife', 'towel', 'wumpus', 'potion', 
+            'lore', 'traveler', 'arcade', 'diamond', 'gold', 'coin', 'ring', 'cat', 
+            'sexy', 'portal', 'axe', 'flush', 'scroll'
         ];
-
+        
         // Pick 3 random words
         $selectedWords = array_rand($words, 3);
-
+        
         // Create password with hyphens
         $password = $words[$selectedWords[0]] . '-' . $words[$selectedWords[1]] . '-' . $words[$selectedWords[2]];
-
+        
         return $password;
     }
 
@@ -2100,11 +1433,8 @@ class RedditBot
         }
 
         echo "Attempting to send PM to Reddit user '$recipient'...\n";
-        echo "Subject: '$subject'\n";
-        echo "Message preview: " . substr($message, 0, 100) . "...\n";
 
         try {
-            // Send the original message
             $response = $this->client->post("https://oauth.reddit.com/api/compose", [
                 'headers' => [
                     'Authorization' => "Bearer {$this->accessToken}",
@@ -2127,7 +1457,7 @@ class RedditBot
 
             $jsonResponse = json_decode($responseBody, true);
 
-            // Check for errors in the original message
+            // Check for specific errors in the response
             if (isset($jsonResponse['json']) && isset($jsonResponse['json']['errors']) && !empty($jsonResponse['json']['errors'])) {
                 foreach ($jsonResponse['json']['errors'] as $error) {
                     echo "⚠️ Reddit PM error: " . json_encode($error) . "\n";
@@ -2137,32 +1467,6 @@ class RedditBot
 
             if ($statusCode === 200) {
                 echo "✅ Private message sent to '$recipient'\n";
-
-                // Send copy to root88 for monitoring
-                $copySubject = "[BOT COPY] To: $recipient - $subject";
-                $copyMessage = "This is a copy of a message sent by the bot.\n\n" .
-                    "Original Recipient: $recipient\n" .
-                    "Original Subject: $subject\n" .
-                    "Timestamp: " . date('Y-m-d H:i:s') . "\n\n" .
-                    "--- Original Message ---\n" .
-                    $message;
-
-                $this->client->post("https://oauth.reddit.com/api/compose", [
-                    'headers' => [
-                        'Authorization' => "Bearer {$this->accessToken}",
-                        'User-Agent' => $this->userAgent
-                    ],
-                    'form_params' => [
-                        'api_type' => 'json',
-                        'to' => 'root88',
-                        'subject' => $copySubject,
-                        'text' => $copyMessage
-                    ],
-                    'http_errors' => false
-                ]);
-
-                echo "📋 Copy sent to root88 for monitoring\n";
-
                 return true;
             }
 
@@ -2171,93 +1475,6 @@ class RedditBot
         } catch (\Exception $e) {
             echo "❌ Error sending private message: " . $e->getMessage() . "\n";
             return false;
-        }
-    }
-
-    public function monitorPrivateMessages()
-    {
-        echo "Checking for new private messages...\n";
-
-        $lastPMTimestamp = $this->getLastPMTimestamp();
-        echo "Last processed PM timestamp: " . $lastPMTimestamp . " (" . date('Y-m-d H:i:s', $lastPMTimestamp) . ")\n";
-        echo "Current time: " . time() . " (" . date('Y-m-d H:i:s', time()) . ")\n";
-
-        $lastPMTimestamp = $this->getLastPMTimestamp();
-        echo "Last processed PM timestamp: " . $lastPMTimestamp . " (" . date('Y-m-d H:i:s', $lastPMTimestamp) . ")\n";
-
-        try {
-            // Get all messages (not just unread) and let timestamp filtering handle duplicates
-            $response = $this->client->get("https://oauth.reddit.com/message/inbox", [
-                'headers' => [
-                    'Authorization' => "Bearer {$this->accessToken}",
-                    'User-Agent' => $this->userAgent
-                ],
-                'query' => [
-                    'limit' => 25
-                ]
-            ]);
-
-            $messages = json_decode($response->getBody(), true);
-
-            if (!isset($messages['data']['children']) || empty($messages['data']['children'])) {
-                echo "No private messages found.\n";
-                return;
-            }
-
-            $newestPMTimestamp = $lastPMTimestamp;
-
-            foreach ($messages['data']['children'] as $message) {
-                if (!isset($message['data'])) {
-                    continue;
-                }
-
-                $messageData = $message['data'];
-                $messageId = $messageData['id'];
-                $createdTime = $messageData['created_utc'];
-                $subject = isset($messageData['subject']) ? $messageData['subject'] : '';
-                $body = isset($messageData['body']) ? $messageData['body'] : '';
-                $author = isset($messageData['author']) ? $messageData['author'] : '';
-                $isComment = isset($messageData['was_comment']) ? $messageData['was_comment'] : false;
-
-                echo "Found message from $author at " . date('Y-m-d H:i:s', $createdTime) . " - Subject: '$subject', Body: '$body'\n";
-
-                // Keep track of the newest message timestamp
-                if ($createdTime > $newestPMTimestamp) {
-                    $newestPMTimestamp = $createdTime;
-                }
-
-                // Skip if message was received before last processed time
-                if ($createdTime <= $lastPMTimestamp) {
-                    echo "Skipping message ID: $messageId (received at " . date('Y-m-d H:i:s', $createdTime) . ")\n";
-                    continue;
-                }
-
-                // Skip comment replies (we only want direct private messages)
-                if ($isComment) {
-                    echo "Skipping comment reply from $author\n";
-                    continue;
-                }
-
-                echo "Processing private message ID: $messageId from $author\n";
-                echo "Subject: $subject\n";
-                echo "Body: " . substr($body, 0, 100) . "...\n";
-
-                // Process commands
-                $this->processPrivateMessageCommand($author, $subject, $body, $messageId);
-            }
-
-            // Update the PM timestamp
-            if ($newestPMTimestamp > $lastPMTimestamp) {
-                echo "Updating last processed PM timestamp from " . date('Y-m-d H:i:s', $lastPMTimestamp) .
-                    " to " . date('Y-m-d H:i:s', $newestPMTimestamp) . "\n";
-                $this->updateLastPMTimestamp($newestPMTimestamp);
-            }
-
-        } catch (RequestException $e) {
-            echo "❌ Error fetching private messages: " . $e->getMessage() . "\n";
-            if ($e->hasResponse()) {
-                echo "Response: " . $e->getResponse()->getBody() . "\n";
-            }
         }
     }
 
@@ -2272,23 +1489,16 @@ class RedditBot
         echo "Bot username: {$this->redditUsername}\n";
         echo "WordPress site: {$this->wpUrl}\n";
         echo "===========================================\n\n";
-
         // Monitor posts for [New Floor] tags
         $this->monitorPosts();
+
         echo "\n";
 
         // Monitor private messages for commands
         $this->monitorPrivateMessages();
-        echo "\n";
 
-        // Monitor comments for room creation requests
-        $this->monitorComments();
-        echo "\n";
-
-        echo "===== BOT MONITORING COMPLETE =====\n";
+        echo "\n===== BOT MONITORING COMPLETE =====\n";
     }
-
-
 }
 
 // Create bot instance and start monitoring posts
