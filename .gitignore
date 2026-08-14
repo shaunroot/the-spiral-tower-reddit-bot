@@ -1,0 +1,103 @@
+# Standard OS-generated files
+
+config.json
+composer.lock
+
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Runtime data
+*.pid
+*.seed
+*.pid.lock
+
+# Compiled source
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+
+# Packages
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Backup files
+*.bak
+*.tmp
+*.swp
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+
+# macOS
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.cache/
+.wafpickle-*
+
+# VCS
+.git/
+.hg/
+.svn/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Environment files
+.env
+.env.*
+
+# Coverage reports
+coverage/
+*.lcov
+
+# Test outputs
+test-output/
+junit.xml
+
+# Custom ignores
+src/
+vendor/
+.claude/
+
+# Secret bot features (The Claw, The Flush) — separate private repo
+plugins/

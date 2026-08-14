@@ -1,4 +1,5 @@
 {
+  "plugins_enabled": false,
   "reddit": {
     "username": "your_reddit_username",
     "password": "your_reddit_password",
