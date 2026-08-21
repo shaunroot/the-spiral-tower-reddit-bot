@@ -809,17 +809,15 @@ class RedditBot
                     if (isset($body['id'])) {
                         $postId = $body['id'];
                         echo "✅ sendRedditPrivateMessage root88: $postId\n";
-                        // Send notification to root88 for testing
+                        // Notify root88 (admin) of the new floor.
                         $this->sendRedditPrivateMessage(
                             "root88",
-                            "Test Floor Created",
+                            "New Floor Created: #$floorNumber — $title",
                             "A new floor was created on The Spiral Tower:\n\n" .
-                            "Floor Number: $floorNumber\n" .
-                            "Title: $title\n" .
-                            "Created By: " . ($redditUsername ?: "Unknown") . "\n" .
-                            "WordPress User ID: " . ($authorId ?: "None") . "\n\n" .
-                            "Link: " . (isset($body['link']) ? $body['link'] : "Not available") . "\n\n" .
-                            "Reddit Post: " . ($redditPostUrl ?: "Not available")
+                            "Floor: #$floorNumber — $title\n" .
+                            "Created by: u/" . ($redditUsername ?: "Unknown") . "\n\n" .
+                            "View it: " . (isset($body['link']) ? $body['link'] : "Not available") . "\n" .
+                            "Reddit post: " . ($redditPostUrl ?: "Not available")
                         );
                         return $body;
                     }
@@ -2449,6 +2447,53 @@ class RedditBot
     }
 
     /**
+     * Remove a user's flair on the subreddit. Called when someone is flushed so
+     * their old number doesn't linger on Reddit and collide with whoever inherits
+     * that number at renumber (or with themselves if they're invited back). Needs
+     * the `modflair` scope.
+     */
+    private function clearUserFlair($username)
+    {
+        try {
+            $response = $this->client->post("https://oauth.reddit.com/r/{$this->subreddit}/api/deleteflair", [
+                'headers'     => ['Authorization' => "Bearer {$this->accessToken}", 'User-Agent' => $this->userAgent],
+                'form_params' => ['api_type' => 'json', 'name' => $username],
+                'http_errors' => false,
+            ]);
+            $code = $response->getStatusCode();
+            if ($code === 200) {
+                echo "✅ Cleared flair for u/$username\n";
+                return true;
+            }
+            echo "⚠️ Clear flair u/$username returned $code: " . $response->getBody() . "\n";
+            return false;
+        } catch (\Exception $e) {
+            echo "❌ clearUserFlair($username): " . $e->getMessage() . "\n";
+            return false;
+        }
+    }
+
+    /**
+     * One-off: clear a single user's flair on Reddit and in the DB. Used to fix a
+     * stale number left behind when a user was flushed and quickly invited back.
+     * Does NOT change their number/status.
+     */
+    public function clearFlairForUser($username)
+    {
+        $username = trim($username);
+        echo "Clearing flair for u/$username...\n";
+        $ok = $this->clearUserFlair($username);
+        if (class_exists('STI_Database')) {
+            $u = STI_Database::get_user_by_username($username);
+            if ($u) {
+                STI_Database::set_flair($u['id'], '');
+                echo "✅ DB flair cleared for u/$username (id {$u['id']})\n";
+            }
+        }
+        return $ok;
+    }
+
+    /**
      * Fetch the subreddit's approved-users (contributor) list from Reddit.
      * Paginated. Returns an array of usernames, or null if the fetch failed
      * (e.g. the bot isn't a moderator yet — needs mod access).
@@ -2801,6 +2846,8 @@ class RedditBot
                 continue;
             }
             $this->removeContributor($username);
+            $this->clearUserFlair($username);   // wipe their old number so it can't collide
+            usleep(1200000);                     // pace the extra flair write under Reddit's ~60/min limit
             if ($hadNumber && $goodbyeOn && $goodbye !== '') {
                 $this->sendRedditPrivateMessage($username, "You've been removed from r/TheSpiralTower", $goodbye);
             }
@@ -2950,6 +2997,9 @@ $bot = new RedditBot($config['reddit']['subreddit']);
 // [New Floor] post the monitor skipped, without running the full loop.
 if (PHP_SAPI === 'cli' && isset($argv[1]) && strpos($argv[1], '--floor=') === 0) {
     $bot->processFloorPostById(substr($argv[1], strlen('--floor=')));
+} elseif (PHP_SAPI === 'cli' && isset($argv[1]) && strpos($argv[1], '--clearflair=') === 0) {
+    // One-off: `php reddit_bot.php --clearflair=<username>` wipes a stale flair.
+    $bot->clearFlairForUser(substr($argv[1], strlen('--clearflair=')));
 } else {
     $bot->run();
 }
