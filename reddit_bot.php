@@ -282,36 +282,77 @@ class RedditBot
             $floorName = trim($matches[2]);
 
             echo "✅ Match found! Floor Number: $floorNumber, Floor Name: '$floorName'\n";
-
-            // Check if floor number already exists
-            if ($this->floorNumberExists($floorNumber)) {
-                echo "⚠️ Floor number $floorNumber already exists. Notifying user.\n";
-
-                // Reply to the Reddit post with a comment about the duplicate floor
-                $this->replyToPost($postId, "Sorry, that floor has already been claimed. You can create a room on that floor if you like.");
-                return;
-            }
-
-            // Get or create WordPress user for the Reddit author
-            $authorId = $this->checkUserExists($redditUsername);
-            if (!$authorId) {
-                $authorId = $this->createWordPressUser($redditUsername);
-            }
-
-            $postBody = $this->createWordPressPost($floorName, $selftext, $floorNumber, $authorId, $redditUsername, $redditPostUrl);
-            $this->sendRedditPrivateMessage(
-                $redditUsername,
-                "Your Floor Has Been Created",
-                "Your floor '$floorName' (number $floorNumber) has been successfully created on The Spiral Tower.\n\n" .
-                "View it here: " . (isset($postBody['link']) ? $postBody['link'] : "https://www.thespiraltower.net/floor/") . "\n\n" .
-                self::MORE_INFO_LINK
-            );
-
-            // Reply to the Reddit post with a comment
-            $this->replyToPost($postId, "Floor '$floorName' has been created in the tower! View it here: " . $postBody['link'] . "\n\n" . self::MORE_INFO_LINK);
+            $this->createFloor($floorNumber, $floorName, $postId, $selftext, $redditUsername, $redditPostUrl);
         } else {
             echo "No match found in this post title.\n";
         }
+    }
+
+    /**
+     * Shared floor-creation body: duplicate-check, ensure the author's WP user,
+     * create the WP floor (which also generates the image + sets the featured
+     * image), PM the author, and reply on the Reddit post.
+     */
+    private function createFloor($floorNumber, $floorName, $postId, $selftext, $redditUsername, $redditPostUrl)
+    {
+        // Check if floor number already exists
+        if ($this->floorNumberExists($floorNumber)) {
+            echo "⚠️ Floor number $floorNumber already exists. Notifying user.\n";
+
+            // Reply to the Reddit post with a comment about the duplicate floor
+            $this->replyToPost($postId, "Sorry, that floor has already been claimed. You can create a room on that floor if you like.");
+            return;
+        }
+
+        // Get or create WordPress user for the Reddit author
+        $authorId = $this->checkUserExists($redditUsername);
+        if (!$authorId) {
+            $authorId = $this->createWordPressUser($redditUsername);
+        }
+
+        $postBody = $this->createWordPressPost($floorName, $selftext, $floorNumber, $authorId, $redditUsername, $redditPostUrl);
+        $this->sendRedditPrivateMessage(
+            $redditUsername,
+            "Your Floor Has Been Created",
+            "Your floor '$floorName' (number $floorNumber) has been successfully created on The Spiral Tower.\n\n" .
+            "View it here: " . (isset($postBody['link']) ? $postBody['link'] : "https://www.thespiraltower.net/floor/") . "\n\n" .
+            self::MORE_INFO_LINK
+        );
+
+        // Reply to the Reddit post with a comment
+        $this->replyToPost($postId, "Floor '$floorName' has been created in the tower! View it here: " . $postBody['link'] . "\n\n" . self::MORE_INFO_LINK);
+    }
+
+    /**
+     * Manual one-off for malformed titles: fetch the post for its author/body,
+     * but force the floor number + name. Example: a title of "[Basement 15]"
+     * that should have been "[-15]" → created as floor -15.
+     */
+    public function createFloorManually($postId, $floorNumber, $floorName)
+    {
+        $postId = preg_replace('/^t3_/', '', trim($postId));
+        echo "Manual floor creation: post t3_$postId → floor $floorNumber '$floorName'\n";
+
+        $response = $this->client->get("https://oauth.reddit.com/api/info", [
+            'headers' => [
+                'Authorization' => "Bearer {$this->accessToken}",
+                'User-Agent' => $this->userAgent
+            ],
+            'query' => ['id' => 't3_' . $postId]
+        ]);
+        $data     = json_decode($response->getBody(), true);
+        $children = isset($data['data']['children']) ? $data['data']['children'] : array();
+        if (empty($children) || !isset($children[0]['data'])) {
+            echo "❌ Post t3_$postId not found.\n";
+            return;
+        }
+        $post           = $children[0]['data'];
+        $selftext       = isset($post['selftext']) ? $post['selftext'] : '';
+        $redditUsername = isset($post['author']) ? $post['author'] : '';
+        $redditPostUrl  = isset($post['permalink']) ? 'https://www.reddit.com' . $post['permalink'] : '';
+        echo "Reddit Author: $redditUsername\n";
+
+        $this->createFloor($floorNumber, trim($floorName), $postId, $selftext, $redditUsername, $redditPostUrl);
     }
 
     /**
@@ -2428,20 +2469,29 @@ class RedditBot
 
     private function setUserFlairNumber($username, $number)
     {
+        return $this->setUserFlairText($username, '#' . (int) $number);
+    }
+
+    /**
+     * Set an arbitrary flair text on a user. Used by the renumber pass so a number
+     * can carry an emoji suffix (e.g. "#222 🦆🦆🦆") from the Number-emojis setting.
+     */
+    private function setUserFlairText($username, $text)
+    {
         try {
             $response = $this->client->post("https://oauth.reddit.com/r/{$this->subreddit}/api/flair", [
                 'headers'     => ['Authorization' => "Bearer {$this->accessToken}", 'User-Agent' => $this->userAgent],
-                'form_params' => ['api_type' => 'json', 'name' => $username, 'text' => '#' . (int) $number],
+                'form_params' => ['api_type' => 'json', 'name' => $username, 'text' => $text],
                 'http_errors' => false,
             ]);
             $code = $response->getStatusCode();
             if ($code === 200) {
                 return true;
             }
-            echo "⚠️ Flair u/$username => #$number returned $code: " . $response->getBody() . "\n";
+            echo "⚠️ Flair u/$username => \"$text\" returned $code: " . $response->getBody() . "\n";
             return false;
         } catch (\Exception $e) {
-            echo "❌ setUserFlairNumber($username): " . $e->getMessage() . "\n";
+            echo "❌ setUserFlairText($username): " . $e->getMessage() . "\n";
             return false;
         }
     }
@@ -2855,15 +2905,27 @@ class RedditBot
             echo "Flushed User {$numLabel}u/$username\n";
         }
 
+        // Number → emoji suffix map (e.g. 222 => "🦆🦆🦆"), plus the map applied at the
+        // previous flush so a removed entry gets stripped from its number's flair.
+        $emojiMap    = method_exists('STI_Settings', 'number_emojis') ? STI_Settings::number_emojis() : array();
+        $prevApplied = method_exists('STI_Settings', 'number_emojis_applied') ? STI_Settings::number_emojis_applied() : array();
+
         $survivors = STI_Database::get_members_ordered_by_number();
         $n = 1;
         $changed = 0;
         foreach ($survivors as $u) {
-            $current = $u['number'] !== null ? (int) $u['number'] : null;
-            if ($current !== $n) {                // only rewrite when the number actually moved
+            $current    = $u['number'] !== null ? (int) $u['number'] : null;
+            $inMap      = isset($emojiMap[$n]);
+            $wasApplied = isset($prevApplied[$n]);
+            // Desired flair: "#<n>" plus the emoji if this number has one.
+            $desiredFlair = '#' . $n . ($inMap ? ' ' . $emojiMap[$n] : '');
+            // Write when the number moved, or when an emoji needs applying/clearing.
+            if ($current !== $n || $inMap || $wasApplied) {
                 if (!$dryRun) {
-                    STI_Database::set_number($u['id'], $n);
-                    $this->setUserFlairNumber($u['reddit_username'], $n);
+                    if ($current !== $n) {
+                        STI_Database::set_number($u['id'], $n);
+                    }
+                    $this->setUserFlairText($u['reddit_username'], $desiredFlair);
                     usleep(1200000); // pace flair writes under Reddit's ~60/min limit
                 }
                 $changed++;
@@ -2873,7 +2935,45 @@ class RedditBot
         echo ($dryRun ? "[dry-run] " : "") . "Renumbered " . count($survivors) . " members — "
             . "$changed flair change" . ($changed === 1 ? "" : "s") . " written\n";
 
+        // Remember which number→emoji map we just applied (live only), so next
+        // flush knows which numbers to strip if an entry was removed meanwhile.
+        if (!$dryRun && method_exists('STI_Settings', 'set_number_emojis_applied')) {
+            STI_Settings::set_number_emojis_applied($emojiMap);
+        }
+
         // Announce the flush on the subreddit — always, even if nobody was flushed.
+        // $survivors are in renumber order (post-flush number = index + 1), so the
+        // appendix can map each joke-number to the member who now holds it.
+        $body = $this->composeFlushBody($flushed, $survivors);
+        if ($dryRun) {
+            echo "[dry-run] Created Flush Post (FLUSH!):\n$body\n";
+        } else {
+            $this->postToSubreddit('FLUSH!', $body);
+            echo "Created Flush Post\n";
+            $this->disarmFlushAppendix();   // the one-time appendix fires exactly once
+        }
+
+        // After the flush, invite the Claw's queued list onto the roster.
+        $this->inviteQueuedUsers($dryRun);
+
+        // (mark_flush_ran already called at the start to claim the window.)
+        if (!$dryRun) {
+            STI_Settings::mark_flush_actual();   // true "when the flush ran" for the Flush List
+            STI_Database::clear_claw_log();
+        }
+        echo "===== FLUSH COMPLETE =====\n";
+    }
+
+    /**
+     * Build the FLUSH! post body: the flushed-name list, plus (if armed) the
+     * one-time appendix below a "---" divider. Shared by the live flush and the
+     * --previewflush command so both render identically.
+     *
+     * @param array $flushed   [['number'=>int|null,'username'=>string], ...] removed this run
+     * @param array $survivors members in post-renumber order (index 0 => number 1)
+     */
+    private function composeFlushBody($flushed, $survivors)
+    {
         if ($flushed) {
             usort($flushed, function ($a, $b) {
                 if ($a['number'] === null && $b['number'] === null) { return strcasecmp($a['username'], $b['username']); }
@@ -2891,22 +2991,143 @@ class RedditBot
         } else {
             $body = "Amazingly no one was flushed... or I am completely broken!";
         }
-        if ($dryRun) {
-            echo "[dry-run] Created Flush Post (FLUSH!):\n$body\n";
-        } else {
-            $this->postToSubreddit('FLUSH!', $body);
-            echo "Created Flush Post\n";
+
+        $appendix = $this->buildFlushAppendix($survivors, $flushed);
+        if ($appendix !== '') {
+            $body .= "\n\n---\n\n" . $appendix;
+        }
+        return $body;
+    }
+
+    /**
+     * Render the one-time appendix from flush_appendix.php against the freshly
+     * renumbered roster. Returns '' when no template is armed. Slots whose number
+     * exceeds the roster size are dropped; " [NEW]" marks holders whose number
+     * changed this week.
+     */
+    private function buildFlushAppendix($survivors, $flushed)
+    {
+        $tmplFile = __DIR__ . '/flush_appendix.php';
+        if (!file_exists($tmplFile)) {
+            return '';
+        }
+        $t = include $tmplFile;
+        if (!is_array($t) || empty($t['slots'])) {
+            return '';
         }
 
-        // After the flush, invite the Claw's queued list onto the roster.
-        $this->inviteQueuedUsers($dryRun);
+        $N = count($survivors);
+        $flushCount = count($flushed);
 
-        // (mark_flush_ran already called at the start to claim the window.)
-        if (!$dryRun) {
-            STI_Settings::mark_flush_actual();   // true "when the flush ran" for the Flush List
-            STI_Database::clear_claw_log();
+        // Newcomers = survivors who had no number before and get one now.
+        $newcomers = 0;
+        foreach ($survivors as $s) {
+            if ($s['number'] === null) { $newcomers++; }
         }
-        echo "===== FLUSH COMPLETE =====\n";
+
+        // Lowest number among the flushed (their pre-flush numbers).
+        $lf = null;
+        foreach ($flushed as $f) {
+            if ($f['number'] !== null && ($lf === null || $f['number'] < $lf['number'])) {
+                $lf = $f;
+            }
+        }
+
+        $out = array();
+        $out[] = $t['honor'];
+        $out[] = '';
+        $out[] = '**' . $flushCount . ' Flushed this week.** 💦';
+        $out[] = '';
+        $out[] = $t['intro'];
+        foreach ($t['slots'] as $slot) {
+            $k = (int) $slot['num'];
+            if ($k < 1 || $k > $N) {
+                continue;                       // number doesn't exist this week — drop the line
+            }
+            $holder = $survivors[$k - 1];
+            $line = str_replace('{u}', $holder['reddit_username'], $slot['tmpl']);
+            if ($holder['number'] === null || (int) $holder['number'] !== $k) {
+                $line .= ' [NEW]';              // changed to (or newly got) this number this week
+            }
+            $out[] = $line;
+        }
+        if (!empty($t['static_tail'])) {
+            foreach ($t['static_tail'] as $line) { $out[] = $line; }
+        }
+        $out[] = '';
+        $out[] = $newcomers . ' freshly numbered fresh meat';
+        if ($lf) {
+            $out[] = 'Lowest number flushed: #' . $lf['number'] . ' u/' . $lf['username'];
+        }
+        if ($N > 0) {
+            $out[] = 'Highest number: #' . $N . ' u/' . $survivors[$N - 1]['reddit_username'];
+        }
+
+        // A line beginning with '#' is a Markdown H1 on Reddit (giant text). Escape
+        // the leading '#' so these render as normal text. (Lines like "Lowest number
+        // flushed: #290" are unaffected — their '#' isn't at the start.)
+        foreach ($out as &$ln) {
+            if (isset($ln[0]) && $ln[0] === '#') {
+                $ln = '\\' . $ln;
+            }
+        }
+        unset($ln);
+
+        return implode("\n", $out);
+    }
+
+    /** Disarm the one-time appendix so it can't post twice. */
+    private function disarmFlushAppendix()
+    {
+        $tmplFile = __DIR__ . '/flush_appendix.php';
+        if (file_exists($tmplFile)) {
+            @rename($tmplFile, $tmplFile . '.used.' . date('Ymd-His'));
+        }
+    }
+
+    /**
+     * Dry, read-only preview of the next FLUSH! post: simulates the flush
+     * (at-risk removal + renumber) in memory and prints the exact post body,
+     * appendix included. No DB writes, no Reddit calls, does not disarm.
+     * NOTE: skips the live per-user "posted in sub this week" spare-check, so a
+     * few borderline members counted here may actually be spared at flush time.
+     */
+    public function previewFlush()
+    {
+        if (!$this->pluginsEnabled || !class_exists('STI_Database')) {
+            echo "Plugins/STI not available — cannot preview.\n";
+            return;
+        }
+        // At flush time runFlushIfDue() calls mark_flush_ran() FIRST, which advances
+        // last_flush to the new run; the at-risk cutoff is then (newLastFlush - 7),
+        // i.e. exactly the CURRENT last_flush_datetime(). Use that here so the preview
+        // matches the real flush (not last_flush - 7, which would be two weeks back).
+        $cutoff = STI_Settings::last_flush_datetime();
+        echo "Preview — activity cutoff (previous flush): " . $cutoff->format('Y-m-d H:i') . "\n";
+
+        $atRisk = STI_Database::get_at_risk_members($cutoff->format('Y-m-d H:i:s'));
+        $flushedNames = array();
+        $flushed = array();
+        foreach ($atRisk as $u) {
+            if (STI_Database::is_unflushable($u['reddit_username'])) {
+                continue;
+            }
+            $flushedNames[strtolower($u['reddit_username'])] = true;
+            $flushed[] = array(
+                'number'   => $u['number'] !== null ? (int) $u['number'] : null,
+                'username' => $u['reddit_username'],
+            );
+        }
+        $survivors = array();
+        foreach (STI_Database::get_members_ordered_by_number() as $u) {
+            if (!isset($flushedNames[strtolower($u['reddit_username'])])) {
+                $survivors[] = $u;
+            }
+        }
+
+        $body = $this->composeFlushBody($flushed, $survivors);
+        echo "\n===== PREVIEW FLUSH POST =====\n\n" . $body . "\n\n===== END PREVIEW =====\n";
+        echo "\n(flushed: " . count($flushed) . ", survivors / highest #: " . count($survivors) . ")\n";
     }
 
     public function run()
@@ -3000,6 +3221,19 @@ if (PHP_SAPI === 'cli' && isset($argv[1]) && strpos($argv[1], '--floor=') === 0)
 } elseif (PHP_SAPI === 'cli' && isset($argv[1]) && strpos($argv[1], '--clearflair=') === 0) {
     // One-off: `php reddit_bot.php --clearflair=<username>` wipes a stale flair.
     $bot->clearFlairForUser(substr($argv[1], strlen('--clearflair=')));
+} elseif (PHP_SAPI === 'cli' && isset($argv[1]) && $argv[1] === '--previewflush') {
+    // Read-only preview of the next FLUSH! post (no writes, no Reddit).
+    $bot->previewFlush();
+} elseif (PHP_SAPI === 'cli' && isset($argv[1]) && $argv[1] === '--manualfloor') {
+    // One-off for malformed titles: --manualfloor <postId> <number> <name...>
+    $postId = isset($argv[2]) ? $argv[2] : '';
+    $number = isset($argv[3]) ? $argv[3] : '';
+    $name   = isset($argv[4]) ? implode(' ', array_slice($argv, 4)) : '';
+    if ($postId === '' || $number === '' || $name === '') {
+        echo "Usage: php reddit_bot.php --manualfloor <postId> <number> <name...>\n";
+    } else {
+        $bot->createFloorManually($postId, $number, $name);
+    }
 } else {
     $bot->run();
 }
