@@ -2910,7 +2910,26 @@ class RedditBot
         $emojiMap    = method_exists('STI_Settings', 'number_emojis') ? STI_Settings::number_emojis() : array();
         $prevApplied = method_exists('STI_Settings', 'number_emojis_applied') ? STI_Settings::number_emojis_applied() : array();
 
-        $survivors = STI_Database::get_members_ordered_by_number();
+        // Unflushable users (moderators, etc.) are excluded from numbering entirely:
+        // strip any number they still hold and clear their number flair, then renumber
+        // only the flushable survivors 1..N so the sequence stays gap-free.
+        $ordered   = STI_Database::get_members_ordered_by_number();
+        $survivors = array();
+        foreach ($ordered as $u) {
+            if (STI_Database::is_unflushable($u['reddit_username'])) {
+                if ($u['number'] !== null) {
+                    echo "Stripping number #{$u['number']} from unflushable u/{$u['reddit_username']}\n";
+                    if (!$dryRun) {
+                        STI_Database::set_number($u['id'], null);
+                        $this->clearUserFlair($u['reddit_username']);
+                        usleep(1200000);
+                    }
+                }
+                continue;
+            }
+            $survivors[] = $u;
+        }
+
         $n = 1;
         $changed = 0;
         foreach ($survivors as $u) {
@@ -3120,9 +3139,13 @@ class RedditBot
         }
         $survivors = array();
         foreach (STI_Database::get_members_ordered_by_number() as $u) {
-            if (!isset($flushedNames[strtolower($u['reddit_username'])])) {
-                $survivors[] = $u;
+            if (isset($flushedNames[strtolower($u['reddit_username'])])) {
+                continue;   // being flushed
             }
+            if (STI_Database::is_unflushable($u['reddit_username'])) {
+                continue;   // unflushable users are excluded from numbering
+            }
+            $survivors[] = $u;
         }
 
         $body = $this->composeFlushBody($flushed, $survivors);
