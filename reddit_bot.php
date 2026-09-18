@@ -2969,7 +2969,6 @@ class RedditBot
         } else {
             $this->postToSubreddit('FLUSH!', $body);
             echo "Created Flush Post\n";
-            $this->disarmFlushAppendix();   // the one-time appendix fires exactly once
         }
 
         // After the flush, invite the Claw's queued list onto the roster.
@@ -3026,14 +3025,15 @@ class RedditBot
      */
     private function buildFlushAppendix($survivors, $flushed)
     {
-        $tmplFile = __DIR__ . '/flush_appendix.php';
-        if (!file_exists($tmplFile)) {
+        if (!class_exists('STI_Settings') || !method_exists('STI_Settings', 'number_captions')) {
             return '';
         }
-        $t = include $tmplFile;
-        if (!is_array($t) || empty($t['slots'])) {
-            return '';
+        $captions = STI_Settings::number_captions();
+        if (!$captions) {
+            return '';                          // no AnalySQUISH captions configured
         }
+        $header = STI_Settings::analysquish_header();
+        $intro  = STI_Settings::analysquish_intro();
 
         $N = count($survivors);
         $flushCount = count($flushed);
@@ -3053,25 +3053,27 @@ class RedditBot
         }
 
         $out = array();
-        $out[] = $t['honor'];
+        $out[] = $header;
         $out[] = '';
         $out[] = '**' . $flushCount . ' Flushed this week.** 💦';
         $out[] = '';
-        $out[] = $t['intro'];
-        foreach ($t['slots'] as $slot) {
-            $k = (int) $slot['num'];
-            if ($k < 1 || $k > $N) {
-                continue;                       // number doesn't exist this week — drop the line
-            }
-            $holder = $survivors[$k - 1];
-            $line = str_replace('{u}', $holder['reddit_username'], $slot['tmpl']);
-            if ($holder['number'] === null || (int) $holder['number'] !== $k) {
-                $line .= ' [NEW]';              // changed to (or newly got) this number this week
+        $out[] = $intro;
+        ksort($captions);
+        foreach ($captions as $k => $tmpl) {
+            $k = (int) $k;
+            if (strpos($tmpl, '{u}') !== false) {
+                if ($k < 1 || $k > $N) {
+                    continue;                   // no holder this week — drop the line
+                }
+                $holder = $survivors[$k - 1];
+                $line = str_replace('{u}', $holder['reddit_username'], $tmpl);
+                if ($holder['number'] === null || (int) $holder['number'] !== $k) {
+                    $line .= ' [NEW]';          // changed to (or newly got) this number this week
+                }
+            } else {
+                $line = $tmpl;                  // static gag (no {u}) — always shown
             }
             $out[] = $line;
-        }
-        if (!empty($t['static_tail'])) {
-            foreach ($t['static_tail'] as $line) { $out[] = $line; }
         }
         $out[] = '';
         $out[] = $newcomers . ' freshly numbered fresh meat';
@@ -3083,25 +3085,17 @@ class RedditBot
         }
 
         // A line beginning with '#' is a Markdown H1 on Reddit (giant text). Escape
-        // the leading '#' so these render as normal text. (Lines like "Lowest number
+        // the leading '#' so caption/footer lines render as normal text. The header
+        // (index 0) is intentionally left as an H1 title. (Lines like "Lowest number
         // flushed: #290" are unaffected — their '#' isn't at the start.)
-        foreach ($out as &$ln) {
-            if (isset($ln[0]) && $ln[0] === '#') {
+        foreach ($out as $i => &$ln) {
+            if ($i > 0 && isset($ln[0]) && $ln[0] === '#') {
                 $ln = '\\' . $ln;
             }
         }
         unset($ln);
 
         return implode("\n", $out);
-    }
-
-    /** Disarm the one-time appendix so it can't post twice. */
-    private function disarmFlushAppendix()
-    {
-        $tmplFile = __DIR__ . '/flush_appendix.php';
-        if (file_exists($tmplFile)) {
-            @rename($tmplFile, $tmplFile . '.used.' . date('Ymd-His'));
-        }
     }
 
     /**
