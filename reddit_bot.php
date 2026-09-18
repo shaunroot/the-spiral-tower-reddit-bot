@@ -3095,6 +3095,16 @@ class RedditBot
         }
         unset($ln);
 
+        // Reddit collapses single newlines into one paragraph. Two trailing spaces
+        // on each content line force a hard line break so the list doesn't run
+        // together (blank separator lines stay as paragraph breaks).
+        foreach ($out as &$ln) {
+            if ($ln !== '') {
+                $ln .= '  ';
+            }
+        }
+        unset($ln);
+
         return implode("\n", $out);
     }
 
