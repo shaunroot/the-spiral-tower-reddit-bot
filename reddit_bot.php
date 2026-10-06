@@ -499,6 +499,16 @@ class RedditBot
 
         echo "No recognized command found in message from $author\n";
     }
+    /**
+     * The WordPress login name for a Reddit user: lowercased with underscores
+     * removed (WordPress rejects underscores). MUST match the transform used when
+     * the account is created, so messages always quote the real login name.
+     */
+    private function wpUsernameFor($redditUsername)
+    {
+        return strtolower(str_replace('_', '', $redditUsername));
+    }
+
     private function handleCreateAccountCommand($redditUsername)
     {
         echo "Handling create account request for $redditUsername\n";
@@ -511,7 +521,7 @@ class RedditBot
                 $redditUsername,
                 "Account Already Exists",
                 "Hello! You already have an account on The Spiral Tower.\n\n" .
-                "Username: " . strtolower($redditUsername) . "\n\n" .
+                "Username: " . $this->wpUsernameFor($redditUsername) . "\n\n" .
                 "If you've forgotten your password, please send me a private message with 'Reset Password' as the subject or message body.\n\n" .
                 "You can log in at https://www.thespiraltower.net/wp-login.php"
             );
@@ -560,7 +570,7 @@ class RedditBot
         if ($success) {
             echo "✅ Successfully reset password for $redditUsername (ID: $userId)\n";
 
-            $username = strtolower($redditUsername);
+            $username = $this->wpUsernameFor($redditUsername);
             $this->sendRedditPrivateMessage(
                 $redditUsername,
                 "Password Reset Complete",
@@ -1504,7 +1514,7 @@ class RedditBot
     private function checkUserExists($username)
     {
         // Convert to lowercase and remove underscores since WordPress usernames are stored this way
-        $sanitizedUsername = strtolower(str_replace('_', '', $username));
+        $sanitizedUsername = $this->wpUsernameFor($username);
         echo "Checking if WordPress user '$username' (sanitized: '$sanitizedUsername') exists...\n";
     
         try {
@@ -1546,7 +1556,7 @@ class RedditBot
         echo "Creating new WordPress user for Reddit user '$redditUsername'...\n";
     
         // Use the Reddit username in lowercase and remove underscores for WordPress
-        $username = strtolower(str_replace('_', '', $redditUsername));
+        $username = $this->wpUsernameFor($redditUsername);
         echo "Using sanitized username: '$username' (from Reddit: '$redditUsername')\n";
     
         // Generate a random password
@@ -1999,7 +2009,7 @@ class RedditBot
 
             try {
                 // Search for floors by title and author
-                $sanitizedAuthor = strtolower(str_replace('_', '', $author));
+                $sanitizedAuthor = $this->wpUsernameFor($author);
 
                 $response = $this->client->get("https://www.thespiraltower.net/wp-json/wp/v2/floor", [
                     'auth' => [$this->wpUser, $this->wpPassword],
